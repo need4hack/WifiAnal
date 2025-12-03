@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.update
@@ -50,42 +51,44 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
 
      //Запускает сканирование локальной сети
-    fun startScan() {
-        // если скан уже идет не запускаем новый
-        if (scanJob?.isActive == true) return
+     fun startScan() {
+         if (scanJob?.isActive == true) return
 
-        scanJob = viewModelScope.launch {
-            val myIp = _uiState.value.networkInfo.myIp
-            if (myIp == "?.?.?.?") {
-                _uiState.update { it.copy(error = "Не удалось определить ваш IP. Скан невозможен.") }
-                return@launch
-            }
+         scanJob = viewModelScope.launch {
+             val myIp = _uiState.value.networkInfo.myIp
 
-            repository.scanLocalNetwork(myIp)
-                .onStart {
-                    // чистим список в начале скана
-                    _uiState.update {
-                        it.copy(
-                            isScanning = true,
-                            foundDevices = emptyList(),
-                            error = null
-                        )
-                    }
-                }
-                .onCompletion {
-                    _uiState.update { it.copy(isScanning = false) }
-                }
-                .catch { e ->
-                    //ошибка
-                    Log.e("DashboardViewModel", "Scan error", e)
-                    _uiState.update { it.copy(error = e.message, isScanning = false) }
-                }
-                .collect { device ->
-                    //добавляем в список найденный девайс
-                    _uiState.update {
-                        it.copy(foundDevices = it.foundDevices + device)
-                    }
-                }
-        }
-    }
+             // Запускаем ДВА сканера параллельно и сливаем результаты (merge)
+             // 1. Обычный пинг по IP
+             val lanFlow = repository.scanLocalNetwork(myIp)
+             // 2. Wi-Fi Direct для поиска MAC-адресов
+             val p2pFlow = repository.scanWifiDirectDevices()
+
+             merge(lanFlow, p2pFlow)
+                 .onStart {
+                     _uiState.update { it.copy(isScanning = true, foundDevices = emptyList(), error = null) }
+                 }
+                 .onCompletion {
+                     _uiState.update { it.copy(isScanning = false) }
+                 }
+                 .catch { e ->
+                     Log.e("Scan", "Error", e)
+                     _uiState.update { it.copy(error = "Ошибка: ${e.message}", isScanning = false) }
+                 }
+                 .collect { device ->
+                     _uiState.update { currentState ->
+                         // Добавляем устройство в список
+                         // Так как P2P устройства не имеют IP (пишем "P2P Discovery"), они не будут конфликтовать с LAN
+                         val newList = currentState.foundDevices.toMutableList()
+
+                         // Простая проверка на дубликаты по имени, если MAC уже есть
+                         val exists = newList.any { it.mac == device.mac && device.mac != "??:??:??:??:??:??" }
+                         if (!exists) {
+                             newList.add(device)
+                         }
+
+                         currentState.copy(foundDevices = newList)
+                     }
+                 }
+         }
+     }
 }

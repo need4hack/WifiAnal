@@ -1,18 +1,26 @@
 package com.example.wifi_analyzer.data
 
-import java.net.InetSocketAddress
-import java.net.Socket
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import android.net.wifi.WifiInfo
 
 // Модель для информации о текущем подключении
@@ -25,7 +33,9 @@ data class CurrentNetworkInfo(
 // Модель для найденного устройства
 data class FoundDevice(
     val ip: String,
-    val hostname: String
+    val hostname: String,
+    val mac: String = "??:??:??:??:??:??",
+    val vendor: String = "Unknown"
 )
 
 //для cканирования портов
@@ -45,6 +55,15 @@ class NetworkRepository(private val context: Context) {
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val wifiManager =
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+    private val vendorMap = mapOf(
+        "005056" to "VMware",
+        "525400" to "QEMU/KVM (Emulator)",
+        "001A11" to "Google",
+        "3C5C48" to "Google Pixel",
+        "F8FFC2" to "Apple",
+        "FC9435" to "Samsung"
+    )
 
     /**
      * Получает информацию о ТЕКУЩЕМ подключении (SSID, IP, Роутер)
@@ -121,6 +140,75 @@ class NetworkRepository(private val context: Context) {
             }
         }
     }.flowOn(Dispatchers.IO) // ВАЖНО: вся работа с сетью - в фоновом потоке
+
+    @SuppressLint("MissingPermission") // Разрешения проверяются в UI
+    fun scanWifiDirectDevices(): Flow<FoundDevice> = callbackFlow {
+        val p2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        val channel = p2pManager?.initialize(context, context.mainLooper, null)
+
+        if (p2pManager == null || channel == null) {
+            close()
+            return@callbackFlow
+        }
+
+        // 1. Создаем ресивер, который будет слушать ответы системы
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                        // Система нашла устройства! Запрашиваем список.
+                        p2pManager.requestPeers(channel) { peersList ->
+                            for (device in peersList.deviceList) {
+                                // ВОТ ОНО! device.deviceAddress - это реальный MAC
+                                val realMac = device.deviceAddress.uppercase()
+                                val deviceName = device.deviceName ?: "Unknown P2P Device"
+                                val vendor = getVendorFromMac(realMac)
+
+                                // IP мы не знаем, так как это P2P обнаружение, а не LAN подключение
+                                // Но зато у нас есть MAC!
+                                trySend(FoundDevice(
+                                    ip = "P2P Discovery", // Маркер, что это найдено через Direct
+                                    hostname = deviceName,
+                                    mac = realMac,
+                                    vendor = vendor
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Регистрируем ресивер
+        val intentFilter = IntentFilter().apply {
+            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
+        }
+        context.registerReceiver(receiver, intentFilter)
+
+        // 3. Запускаем поиск (Discover Peers)
+        p2pManager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                // Скан начался успешно
+            }
+            override fun onFailure(reason: Int) {
+                // Не удалось запустить скан
+            }
+        })
+
+        // 4. При закрытии потока (уход с экрана) убираем мусор
+        awaitClose {
+            try {
+                context.unregisterReceiver(receiver)
+                p2pManager.stopPeerDiscovery(channel, null)
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun getVendorFromMac(mac: String): String {
+        if (mac.length < 8) return "Unknown"
+        val oui = mac.substring(0, 8).replace(":", "").uppercase()
+        return vendorMap[oui] ?: "Unknown Vendor"
+    }
 
     fun scanPorts(ip: String): Flow<PortResult> = flow {
         // Список популярных портов для проверки

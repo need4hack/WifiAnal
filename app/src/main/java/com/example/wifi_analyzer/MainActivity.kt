@@ -16,7 +16,6 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.wifi_analyzer.ui.theme.screens.DashboardScreen
-//import com.example.wifi_analyzer.ui.theme.screens.HostDetailsScreen
 import com.example.wifiinspector.ui.screens.HostDetailsScreen
 
 // Простое определение роутов
