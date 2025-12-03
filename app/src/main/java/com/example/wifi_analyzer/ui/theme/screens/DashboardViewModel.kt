@@ -43,6 +43,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         try {
             val info = repository.getCurrentNetworkInfo()
             _uiState.update { it.copy(networkInfo = info) }
+            viewModelScope.launch {
+                repository.saveNetworkToHistory(info.ssid)
+            }
         } catch (e: Exception) {
             _uiState.update { it.copy(error = "Не удалось получить инфо о сети. Проверьте разрешения.") }
         }

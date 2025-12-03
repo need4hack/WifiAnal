@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.flowOn
 import java.net.Inet4Address
 import java.net.InetAddress
 import android.net.wifi.WifiInfo
+import com.example.wifi_analyzer.database.AppDatabase
+import com.example.wifi_analyzer.database.ScanHistoryEntity
 
 // Модель для информации о текущем подключении
 data class CurrentNetworkInfo(
@@ -160,4 +162,23 @@ class NetworkRepository(private val context: Context) {
             }
         }
     }.flowOn(Dispatchers.IO) // Вся работа с сокетами ТОЛЬКО в IO-потоке
+
+    private val historyDao = AppDatabase.getDatabase(context).scanHistoryDao()
+
+    // --- МЕТОДЫ ИСТОРИИ ---
+
+    // 1. Сохранить сеть в историю
+    suspend fun saveNetworkToHistory(ssid: String) {
+        if (ssid.isBlank() || ssid == "<unknown ssid>" || ssid == "Wi-Fi") return
+
+        // Можно добавить проверку, чтобы не дублировать подряд одну и ту же сеть
+        // Но пока просто пишем всё
+        historyDao.insert(ScanHistoryEntity(ssid = ssid))
+    }
+
+    // 2. Читать историю (Flow, чтобы список сам обновлялся)
+    fun getHistory(): Flow<List<ScanHistoryEntity>> = historyDao.getAllHistory()
+
+    // 3. Очистить
+    suspend fun clearHistory() = historyDao.clearHistory()
 }
