@@ -41,6 +41,12 @@ android {
 }
 
 dependencies {
+    // NetBIOS / SMB (для Windows имен)
+    implementation(libs.jcifs.ng)
+// mDNS / Bonjour (для Apple и IoT)
+    implementation("org.jmdns:jmdns:3.6.2")
+// OkHttp (для получения заголовков HTTP сервера)
+    implementation("com.squareup.okhttp3:okhttp:5.3.2")
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)

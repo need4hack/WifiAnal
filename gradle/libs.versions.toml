@@ -1,8 +1,11 @@
 [versions]
+jcifsNg = "2.1.10"
 room = "2.6.1"
-ksp = "2.0.21-1.0.27"
+#ksp = "2.0.21-1.0.27"
+ksp = "2.1.0-1.0.29"
 agp = "8.13.1"
-kotlin = "2.0.21"
+#kotlin = "2.0.21"
+kotlin = "2.1.0"
 coreKtx = "1.17.0"
 junit = "4.13.2"
 junitVersion = "1.3.0"
@@ -17,6 +20,7 @@ androidx-room-runtime = { group = "androidx.room", name = "room-runtime", versio
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+jcifs-ng = { module = "eu.agno3.jcifs:jcifs-ng", version.ref = "jcifsNg" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
