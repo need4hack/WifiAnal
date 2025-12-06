@@ -37,12 +37,15 @@ import com.example.wifi_analyzer.database.ScanHistoryEntity
 import jcifs.context.SingletonContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.jmdns.JmDNS
+import javax.jmdns.ServiceInfo
 
 // Модель для информации о текущем подключении
 data class CurrentNetworkInfo(
@@ -76,7 +79,7 @@ class NetworkRepository(private val context: Context) {
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
     // Кэш для SSDP ответов (Map<IP, Name>)
-    private val ssdpCache = ConcurrentHashMap<String, String>()
+    private val deviceNamesCache = ConcurrentHashMap<String, String>()
     /**
      * Получает информацию о ТЕКУЩЕМ подключении (SSID, IP, Роутер)
      */
@@ -102,7 +105,7 @@ class NetworkRepository(private val context: Context) {
             ?.hostAddress ?: "?.?.?.?"
 
         // 4. Получаем SSID (имя Wi-Fi)
-        val ssid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val ssidRaw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // На Android 10+ нужен этот метод, и он возвращает "<unknown ssid>",
             // если у приложения нет разрешения на FINE_LOCATION.
             // Но мы попробуем, это лучше, чем ничего.
@@ -112,14 +115,10 @@ class NetworkRepository(private val context: Context) {
         }
 
         // Очищаем SSID от лишних кавычек (e.g. "My_WiFi" -> My_WiFi)
-        val cleanSsid = ssid.removeSurrounding("\"").takeIf { it != "<unknown ssid>" }
+        val cleanSsid = ssidRaw?.removeSurrounding("\"").takeIf { it != "<unknown ssid>" }
             ?: "Wi-Fi (без имени)"
 
-        return CurrentNetworkInfo(
-            ssid = cleanSsid,
-            myIp = myIpAddress,
-            routerIp = routerIpAddress
-        )
+        return CurrentNetworkInfo( cleanSsid, myIpAddress, routerIpAddress)
     }
 
     /**
@@ -135,63 +134,77 @@ class NetworkRepository(private val context: Context) {
         val subnet = myIp.substringBeforeLast('.')
 
         //Слушаем SSDP в отдельной корутине на пару сек. При запуске должно заполнить ssdpCache именами типа "Samsung TV"
-        val ssdpJob = CoroutineScope(Dispatchers.IO).launch {
+        /*val ssdpJob = CoroutineScope(Dispatchers.IO).launch {
             discoverSSDP()
-        }
+        }*/
+
+        // 1. Запускаем фоновые слушатели протоколов (SSDP и mDNS)
+        // Они будут наполнять cache именами, пока идет перебор IP
+        val backgroundJobs = Job()
+        val scope = CoroutineScope(Dispatchers.IO + backgroundJobs)
+
+        scope.launch { discoverSSDP() }
+        scope.launch { discoverMDNS(myIp) }
         delay(500) //небольшая пауза для того чтобы SSDP успел собрать первые ответы
 
+        // Сканируем не более 20 IP одновременно, чтобы не забить сеть и не потерять пакеты
+        val limitConcurrency = Semaphore(20)
         coroutineScope {
-            val checkJobs = (1..254).map{i ->
-                async(Dispatchers.IO){
-                val host = "$subnet.$i"
+            val scanTasks = (1..254).map { i ->
+                async(Dispatchers.IO) {
+                    limitConcurrency.withPermit {
+                        val host = "$subnet.$i"
 
-                // Не пингуем сами себя
-                if (host == myIp) return@async null
+                        // Не пингуем сами себя
+                        if (host == myIp) return@withPermit null
 
-                if (isHostAlive(host)){
-                    // Таймаут 500мс. Если хост не ответил, идем дальше.
-                    val name = resolveDeviceName(host)
-                    return@async FoundDevice(host, name)
+                        if (isHostAlive(host, timeoutMs = 1000)) {
+                            // Таймаут 500мс. Если хост не ответил, идем дальше.
+                            val name = resolveDeviceName(host)
+                            return@withPermit FoundDevice(host, name)
+                        }
+                        return@withPermit null // Игнорируем недостижимые хосты
                     }
-                    return@async null // Игнорируем недостижимые хосты
                 }
             }
-            checkJobs.forEach { job ->
-                val device = job.await()
+            scanTasks.forEach { task ->
+                val device = task.await()
                 if(device != null){
                     emit(device)
                     // Игнорируем недостижимые хосты
                 }
             }
         }
-        ssdpJob.cancel()
+        backgroundJobs.cancel()
     }.flowOn(Dispatchers.IO) // ВАЖНО: вся работа с сетью - в фоновом потоке
 
     //Методы определения имени устройства
-    private fun resolveDeviceName(ip: String): String{
+    private suspend fun resolveDeviceName(ip: String): String {
         //проверка ответило ли устройство по SSDP
-        if(ssdpCache.containsKey(ip)){
-            return ssdpCache[ip]!!
+        if (deviceNamesCache.containsKey(ip)) {
+            return deviceNamesCache[ip]!!
         }
-        //netBIOS-эффективно для ПК
-        val netBiosName = getNetBiosName(ip)
-        if (netBiosName != null) return netBiosName
+        return withContext(Dispatchers.IO) {
+            //netBIOS-эффективно для ПК
+            val netBiosName = getNetBiosName(ip)
+            if (netBiosName != null) return@withContext netBiosName
 
-        //mDNS - устройства Apple, IoT
-        val mdnsName = getMdnsName(ip)
-        if(mdnsName != null) return mdnsName
+            //mDNS - устройства Apple, IoT
+            /*val mdnsName = getMdnsName(ip)
+            if (mdnsName != null) return@withContext mdnsName*/
 
-        //Http заголовок(роутер, камеры и т.д)
-        val httpTitle = getHttpTitle(ip)
-        if(httpTitle != null) return httpTitle
+            //Http заголовок(роутер, камеры и т.д)
+            val http = getHttpTitle(ip)
+            if (http != null) return@withContext http
 
-        //Обычный стандартный DNS
-        return try {
-            val inetAddr = InetAddress.getByName(ip)
-            val hostname = inetAddr.canonicalHostName
-            if(hostname != ip) hostname else ip// Если имя совпадает с ip значит не нашли
-        } catch (e: Exception){
-            ip
+            //Обычный стандартный DNS
+            try {
+                val inetAddr = InetAddress.getByName(ip)
+                val host = inetAddr.canonicalHostName
+                if (host != ip) return@withContext host// Если имя совпадает с ip значит не нашли
+            } catch (e: Exception) {
+            }
+            return@withContext ip
         }
     }
 
@@ -213,8 +226,41 @@ class NetworkRepository(private val context: Context) {
     }
 
     //mDNS (JmDNS)
-    private fun getMdnsName(ip: String): String?{
-        return null
+    private fun discoverMDNS(myLocalIp: String) {
+        var jmdns: JmDNS? = null
+        try {
+            val addr = InetAddress.getByName(myLocalIp)
+            jmdns = JmDNS.create(addr, "Scanner")
+
+            // Добавляем слушателя для всех сервисов
+            jmdns.addServiceTypeListener(object : javax.jmdns.ServiceTypeListener {
+                override fun serviceTypeAdded(event: javax.jmdns.ServiceEvent?) {
+                    // Когда найден тип сервиса, просим найти сами сервисы
+                    event?.type?.let { type ->
+                        jmdns.addServiceListener(type, object : javax.jmdns.ServiceListener {
+                            override fun serviceAdded(event: javax.jmdns.ServiceEvent?) {}
+                            override fun serviceRemoved(event: javax.jmdns.ServiceEvent?) {}
+                            override fun serviceResolved(event: javax.jmdns.ServiceEvent?) {
+                                event?.info?.let { info ->
+                                    // Сохраняем имя устройства для всех его IP адресов
+                                    val name = info.name ?: info.server
+                                    info.inet4Addresses.forEach { ipAddr ->
+                                        deviceNamesCache[ipAddr.hostAddress] = name
+                                    }
+                                }
+                            }
+                        })
+                    }
+                }
+                override fun subTypeForServiceTypeAdded(event: javax.jmdns.ServiceEvent?) {}
+            })
+            // Ждем пока соберется инфо (цикл жизни корутины)
+            Thread.sleep(15000)
+        } catch (e: Exception) {
+            // Ошибка mDNS
+        } finally {
+            jmdns?.close()
+        }
     }
 
     //UPnP/SSDP Discovery
@@ -222,7 +268,7 @@ class NetworkRepository(private val context: Context) {
         var socket: DatagramSocket? = null
         try{
             socket = DatagramSocket()
-            socket.soTimeout = 2000 //ожидание ответа
+            socket.soTimeout = 4000 //ожидание ответа
             //M-search пакет
             val query = "M-SEARCH * HTTP/1.1\\r\\n\" +\n" +
                     "                    \"HOST: 239.255.255.250:1900\\r\\n\" +\n" +
@@ -239,13 +285,15 @@ class NetworkRepository(private val context: Context) {
                 val receivePacket = DatagramPacket(buffer, buffer.size)
                 socket.receive(receivePacket)
                 val response = String(receivePacket.data, 0, receivePacket.length)
-                val remoteIp = receivePacket.address.hostAddress
+                val ip = receivePacket.address.hostAddress
 
                 //Парсим имя ои ответа
-                var serverName = parseHeaderValue(response, "SERVER") ?: "UPnP Device"
+                var name = parseHeader(response, "SERVER") /*?: "UPnP Device"*/
+                if (name == null) name = parseHeader(response, "USN")
 
-                if(remoteIp != null){
-                    ssdpCache[remoteIp] = serverName
+                if(ip != null){
+                    val cleanName = name?.substringBefore("/")?.trim() ?: "UPnP Device"
+                    deviceNamesCache[ip] = cleanName
                 }
             }
         } catch (e: Exception){
@@ -258,49 +306,39 @@ class NetworkRepository(private val context: Context) {
     //Http Title - парсим title с порта 80
     private fun getHttpTitle(ip: String): String?{
         val client = OkHttpClient.Builder()
-            .connectTimeout(300, TimeUnit.MILLISECONDS)
-            .readTimeout(300, TimeUnit.MILLISECONDS)
+            .connectTimeout(500, TimeUnit.MILLISECONDS)
+            .readTimeout(500, TimeUnit.MILLISECONDS)
             .build()
-
-        val request = Request.Builder().url("http://$ip").build()
-        return try {
-            client.newCall(request).execute().use {response ->
-                if (response.isSuccessful){
-                    val body = response.body?.string() ?: ""
-                    val regex = "<title>(.*?)</title>".toRegex(RegexOption.IGNORE_CASE)
-                    regex.find(body)?.groupValues?.get(1)?.trim()
-                } else null
-            }
-        } catch (e: Exception){
+        return try{
+            val req = Request.Builder().url("http://$ip").build()
+            client.newCall(req).execute().use {resp ->
+                    val body = resp.body?.string() ?: ""
+                    "<title>(.*?)</title>".toRegex(RegexOption.IGNORE_CASE).find(body)?.groupValues?.get(1)?.trim()
+                }
+            } catch (e: Exception){
             null
         }
     }
 
     //что то типо парсера
-    private fun parseHeaderValue(content: String, headerName: String): String?{
-        val lines = content.lines()
-        for (line in lines){
-            if(line.startsWith(headerName, ignoreCase = true)){
-                return line.substringAfter(":").trim()
-            }
-        }
-        return null
+    private fun parseHeader(response: String, header: String): String? {
+        return response.lines().find { it.startsWith(header, true) }?.substringAfter(":")?.trim()
     }
 
     //проверка доступности хоста
-    private fun isHostAlive(host: String): Boolean {
+    private fun isHostAlive(host: String, timeoutMs: Int): Boolean {
         try {
             val addr = InetAddress.getByName(host)
             // 1. Быстрый ICMP (если есть права/рут)
-            if (addr.isReachable(200)) return true
+            if (addr.isReachable(timeoutMs/2)) return true
 
             // 2. Если пинг закрыт, пробуем TCP Connect на популярных портах
             // Порты: 80 (Web), 445 (SMB), 135 (RPC), 22 (SSH)
-            val ports = listOf(80, 445, 135, 62078) // 62078 часто открыт на iPhone
+            val ports = listOf(80, 445, 62078, 22, 8080, 53, 554) // 62078 часто открыт на iPhone
             for (port in ports) {
                 try {
-                    Socket().use { socket ->
-                        socket.connect(InetSocketAddress(host, port), 150)
+                    Socket().use {
+                        it.connect(InetSocketAddress(host, port), timeoutMs/ports.size)
                     }
                     return true // Если хоть один порт открыт - хост жив
                 } catch (e: Exception) { /* Port closed */ }
